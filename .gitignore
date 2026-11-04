@@ -1,15 +1,33 @@
+# Original repository exclusions
 *.jpg
 *.raw
 *.csv
 *.bin
 *.egg-info
 
-__pycache__/
 .VSCodeCounter/
 .vscode/
 from_golden_model/
 Test1-20190201/
 build/
 
-
 test/comparison.txt
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python temporary files
+__pycache__/
+*.pyc
+
+# HYPSO datasets
+data/
+*.nc
+
+# Generated experiment results
+results/
+output/
+
+# Temporary files
+*.log
