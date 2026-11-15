@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared execution engine for the vmin/phi study. Use vmin_phi_sweep.py.
 
-Derived from the validated spatial-size wavefront engine; codec maths unchanged.
+Each worker runs one complete configuration. Codec maths are unchanged.
 """
 from __future__ import annotations
 
@@ -15,22 +15,18 @@ import os
 from pathlib import Path
 import platform
 import signal
-import shutil
 import subprocess
 import sys
 import time
 import traceback
-import tempfile
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import psutil
 import _damping_core as core
 import sweep_workers as sw
-import wavefront_predictor as wavefront
 
-VERSION = "1.0.0-vmin-phi-engine"
+VERSION = "2.0.0-vmin-phi-config-workers"
 GIB = 1024**3
 ALIASES = {"lines":"y", "line":"y", "frames":"y", "frame":"y", "rows":"y", "y":"y",
            "samples":"x", "sample":"x", "columns":"x", "cols":"x", "x":"x",
@@ -140,25 +136,22 @@ def worker(spec_path):
                 "predictor_processes_used":1, "predictor_worker_pids":[os.getpid()],
                 "predictor_peak_tasks_in_flight":1, "predictor_tasks":1,
                 "rows_per_task":0, "shared_workspace_bytes":0}
-    context=wavefront.SharedWorkspace(spec["workspace_dir"]) if args.workers>1 else nullcontext(None)
-    with context as workspace:
-        base=(wavefront.predictor_class(workspace,args.workers,args.rows_per_task,statistics)
-              if workspace is not None else model[2].Predictor)
-        class ObservedPredictor(base):
-            def run_predictor(self):
-                nonlocal verification_seconds
-                super().run_predictor()
-                begin=time.perf_counter()
-                for seg in segments:
-                    # Applied update at t uses exponent stored at t-1.
-                    j0=seg["spatial_index_start"]-1;j1=seg["spatial_index_end_inclusive"]
-                    if not np.all(self.weight_update_scaling_exponent[j0:j1]==seg["rho"]):
-                        raise RuntimeError("Actual model adaptation schedule differs from the reported progression.")
-                verification_seconds=time.perf_counter()-begin
-        observed=(model[0],model[1],SimpleNamespace(Predictor=ObservedPredictor),model[3])
-        begin=time.perf_counter()
-        row=core.encode_one(cube,h,args,args.a,args.nu_max,args.phi,observed)
-        total_codec=time.perf_counter()-begin
+    # No nested process pool: this child owns prediction AND entropy encoding.
+    class ObservedPredictor(model[2].Predictor):
+        def run_predictor(self):
+            nonlocal verification_seconds
+            super().run_predictor()
+            begin=time.perf_counter()
+            for seg in segments:
+                # Applied update at t uses exponent stored at t-1.
+                j0=seg["spatial_index_start"]-1;j1=seg["spatial_index_end_inclusive"]
+                if not np.all(self.weight_update_scaling_exponent[j0:j1]==seg["rho"]):
+                    raise RuntimeError("Actual model adaptation schedule differs from the reported progression.")
+            verification_seconds=time.perf_counter()-begin
+    observed=(model[0],model[1],SimpleNamespace(Predictor=ObservedPredictor),model[3])
+    begin=time.perf_counter()
+    row=core.encode_one(cube,h,args,args.a,args.nu_max,args.phi,observed)
+    total_codec=time.perf_counter()-begin
     row.update({k:v for k,v in statistics.items() if k!="predictor_worker_pids"})
     # Remove the observer scan from predictor time; total wall time retains all work.
     row["predictor_seconds"]=max(0.0,row["predictor_seconds"]-verification_seconds)
@@ -169,7 +162,7 @@ def worker(spec_path):
                crop_row=job["crop_row"],crop_col=job["crop_col"],crop_sha256=info["crop_sha256"],
                data_load_seconds=load_seconds,model_seconds=row["predictor_seconds"]+row["encoder_seconds"],
                codec_and_checks_seconds=total_codec,peak_rss_bytes=peak,peak_rss_gib=peak/GIB,
-               peak_rss_method=method+"; crop coordinator only",native_threads=1,estimated_ram_gib=spec["estimated_ram_gib"],
+               peak_rss_method=method+"; complete configuration worker",native_threads=1,estimated_ram_gib=spec["estimated_ram_gib"],
                schedule_verified=1,first_update_at_vmax=cap[0]["spatial_index_start"] if cap else "",
                adaptation_verification_seconds=verification_seconds)
     core.write_json(Path(spec["worker_result"]),{"row":row,"crop":info,"progression":segments,
@@ -209,7 +202,7 @@ def execution_budget(args):
     return min(args.total_memory_gb,sw._available_memory())
 
 
-def allowed_predictor_workers(requested):
+def allowed_configuration_workers(requested):
     limit=requested
     try:limit=min(limit,len(os.sched_getaffinity(0)))
     except AttributeError:limit=min(limit,os.cpu_count() or 1)
@@ -236,7 +229,7 @@ def sample_process_tree(root,include_pss=False):
 
 
 def terminate_job(item):
-    """Stop the entire crop process tree, including spawned predictor workers."""
+    """Stop this configuration process and any unexpected descendants."""
     proc=item["proc"]
     if os.name=="posix":
         try:os.killpg(proc.pid,signal.SIGTERM)
@@ -268,34 +261,34 @@ def run_jobs(args,metadata,repo,out,plot_results):
     pending=[j for j in jobs if j["job_id"] not in done]
     skipped=[];failed=[];active={};aggregate_peak=0;run_start=time.perf_counter()
     diagnostic_fields=["job_id","image","size","t_inc","nu_min","phi","a","repeat","reason"]
-    limit=1  # Deliberate: never run two crops/configurations at once.
-    predictor_limit=allowed_predictor_workers(args.workers)
-    work_root=(args.work_dir or out/"_work").resolve()
-    print(f"Completed {len(done)}/{len(jobs)}; ONE crop at a time; predictor workers "
-          f"requested {args.workers}, CPU allowance {predictor_limit}.",flush=True)
+    cpu_limit=allowed_configuration_workers(args.workers)
+    limit=min(cpu_limit,len(pending))
+    peak_concurrent=0
+    waiting_for_memory=False
+    print(f"Completed {len(done)}/{len(jobs)}; ONE COMPLETE configuration per worker; "
+          f"requested {args.workers}, CPU allowance {cpu_limit}, pending-work limit {limit}. "
+          "RAM budget may reduce concurrency.",flush=True)
     child_args={k:getattr(args,k) for k in ("p","nu_max","psi","a_values","local_sum","prediction_mode",
                                          "low_memory","max_memory_gb","variable")}
-    child_args.update(workers=predictor_limit,rows_per_task=args.rows_per_task)
     try:
         while pending or active:
             while pending and len(active)<limit:
                 job=pending[0]
-                _,_,pool_size=wavefront.task_geometry(job["rows"],job["bands"],predictor_limit,args.rows_per_task)
-                need=job["estimated_ram_gib"]+(0.10*pool_size if predictor_limit>1 else 0)
-                reserved=sum(item["job"]["estimated_ram_gib"] for item in active.values())
+                need=job["estimated_ram_gib"]
+                reserved=sum(max(item["job"]["estimated_ram_gib"],item["last_rss"]/GIB) for item in active.values())
                 reason=job["dimension_issue"]
                 if not reason and need>args.max_memory_gb:reason=f"Estimated {need:.2f} GiB exceeds per-job limit {args.max_memory_gb:.2f}."
                 # Active workers already consume some available RAM. Reserve their remaining allowance.
                 remaining_reserve=sum(max(0,item["job"]["estimated_ram_gib"]-item["last_rss"]/GIB) for item in active.values())
                 enough=need+.35<=execution_budget(args)-remaining_reserve and need+reserved+.35<=args.total_memory_gb
                 if not reason and not enough:
-                    if active:break
+                    if active:
+                        if not waiting_for_memory:
+                            print(f"RAM budget: keeping {len(active)} configuration worker(s) active; "
+                                  "remaining jobs wait for memory.",flush=True)
+                        waiting_for_memory=True
+                        break
                     reason=f"Estimated {need:.2f} GiB + coordinator allowance exceeds current budget {execution_budget(args):.2f} GiB."
-                if not reason and predictor_limit>1:
-                    work_root.mkdir(parents=True,exist_ok=True)
-                    disk=wavefront.workspace_bytes((job["rows"],job["columns"],job["bands"]),args.p,args.prediction_mode=="full")
-                    if disk+256*1024**2>shutil.disk_usage(work_root).free:
-                        reason=f"Shared arrays need {disk/GIB:.2f} GiB of free temporary disk + 0.25 GiB headroom; use --work-dir PATH."
                 pending.pop(0)
                 if reason:
                     skipped.append({k:job[k] for k in diagnostic_fields[:-1]}|{"reason":reason})
@@ -304,9 +297,8 @@ def run_jobs(args,metadata,repo,out,plot_results):
                     continue
                 stem=out/"jobs"/job["job_id"]
                 result=stem.with_suffix(".worker.json");result.unlink(missing_ok=True)
-                workspace=tempfile.mkdtemp(prefix=job["job_id"]+"-",dir=work_root) if predictor_limit>1 else None
                 spec={"args":child_args | {k:job[k] for k in ("nu_min","phi","a")},"job":job,"input":inputs[job["image"]],"repo":str(repo),
-                      "worker_result":str(result),"workspace_dir":workspace,"estimated_ram_gib":need}
+                      "worker_result":str(result),"estimated_ram_gib":need}
                 spec_path=stem.with_suffix(".spec.json");log=None
                 try:
                     core.write_json(spec_path,spec)
@@ -318,16 +310,17 @@ def run_jobs(args,metadata,repo,out,plot_results):
                                           stdout=log,stderr=subprocess.STDOUT,env=env,cwd=repo,start_new_session=os.name=="posix")
                 except BaseException:
                     if log is not None:log.close()
-                    if workspace:shutil.rmtree(workspace)
                     raise
                 active[job["job_id"]]={"job":job,"proc":proc,"ps":psutil.Process(proc.pid),"log":log,
                                       "start":begin,"peak":0,"last_rss":0,"peak_concurrent":1,"result":result,
-                                      "workspace":workspace,"tree_rss_peak":0,"tree_pss_peak":None,
+                                      "tree_rss_peak":0,"tree_pss_peak":None,
                                       "pss_last_time":0,"known_processes":{}}
+                waiting_for_memory=False
+                peak_concurrent=max(peak_concurrent,len(active))
                 for item in active.values():item["peak_concurrent"]=max(item["peak_concurrent"],len(active))
                 print(f"START {job['image']} {job['rows']}x{job['columns']}x{job['bands']} "
                       f"({'full' if job['is_full_image'] else 'crop'}), nu_min={job['nu_min']}, phi={job['phi']}, A={job['a']}, t_inc={job['t_inc']}, repeat={job['repeat']}, "
-                      f"predictor processes={pool_size}, PID={proc.pid}, estimate={need:.2f} GiB",flush=True)
+                      f"configuration worker PID={proc.pid}, active={len(active)}/{limit}, estimate={need:.2f} GiB",flush=True)
             rss_sum=psutil.Process().memory_info().rss
             for key,item in list(active.items()):
                 try:rss=item["ps"].memory_info().rss
@@ -343,8 +336,8 @@ def run_jobs(args,metadata,repo,out,plot_results):
                 if code is None:continue
                 elapsed=time.perf_counter()-item["start"];item["log"].close();job=item["job"]
                 terminate_job(item)
-                if item["workspace"]:shutil.rmtree(item["workspace"])
                 del active[key]
+                waiting_for_memory=False
                 if code!=0 or not item["result"].exists():
                     reason=f"Worker exited with code {code}; inspect jobs/{key}.log (possible memory/process failure)."
                     failed.append({k:job[k] for k in diagnostic_fields[:-1]}|{"reason":reason})
@@ -357,10 +350,10 @@ def run_jobs(args,metadata,repo,out,plot_results):
                     row["peak_rss_bytes"]=max(row["peak_rss_bytes"],item["peak"])
                     row["peak_rss_gib"]=row["peak_rss_bytes"]/GIB
                 row.update(wall_seconds=elapsed,sampled_peak_rss_bytes=item["peak"],workers_requested=args.workers,
-                           peak_concurrent_workers=1,concurrent_crops=1,
+                           peak_concurrent_workers=item["peak_concurrent"],concurrent_crops=item["peak_concurrent"],
                            sampled_tree_peak_rss_gib=item["tree_rss_peak"]/GIB,
                            sampled_tree_peak_pss_gib=item["tree_pss_peak"]/GIB if item["tree_pss_peak"] is not None else "",
-                           tree_memory_method="Sampled crop process tree: RSS sum double-counts shared mappings; Linux PSS apportions sharing. Sampling can miss peaks.")
+                           tree_memory_method="Sampled complete configuration process: RSS includes shared library pages; Linux PSS apportions sharing. Sampling can miss peaks.")
                 record["study_id"]=metadata["study_id"]
                 core.write_json(out/"jobs"/(key+".json"),record)
                 item["result"].unlink(missing_ok=True)
@@ -374,19 +367,20 @@ def run_jobs(args,metadata,repo,out,plot_results):
         for item in active.values():
             terminate_job(item)
             item["log"].close()
-            if item["workspace"]:shutil.rmtree(item["workspace"])
         records=regenerate(out,metadata)
         table(out/"skipped.csv",diagnostic_fields,skipped)
         table(out/"failures.csv",diagnostic_fields,failed)
         core.write_json(out/"last_execution.json",{"completed_total":len(records),"requested_total":len(jobs),
                         "skipped_this_invocation":len(skipped),"failed_this_invocation":len(failed),
                         "wall_seconds":time.perf_counter()-run_start,"sampled_aggregate_peak_rss_gib":aggregate_peak/GIB,
-                        "memory_note":"Sampled sum of coordinator and crop process tree RSS; shared pages are counted more than once. See per-job PSS on Linux.",
-                        "workers_requested":args.workers,"allowed_predictor_workers":predictor_limit,
-                        "concurrent_crops":1,"rows_per_task_requested":args.rows_per_task,"memory_poll_ms":args.memory_poll_ms})
+                        "memory_note":"Sampled sum of coordinator and configuration worker RSS; shared library pages can be counted repeatedly. See per-job PSS on Linux.",
+                        "execution_mode":"one-complete-configuration-per-worker",
+                        "workers_requested":args.workers,"allowed_configuration_workers":cpu_limit,
+                        "peak_concurrent_workers":peak_concurrent,"predictor_workers_per_configuration":1,
+                        "concurrent_crops":peak_concurrent,"memory_poll_ms":args.memory_poll_ms})
         plot_results(records,metadata,out)
     print(f"Complete {len(records)}/{len(jobs)}; skipped {len(skipped)}; failed {len(failed)}. Results: {out}")
-    return 1 if failed or not records else 0
+    return 1 if failed or len(records)!=len(jobs) else 0
 
 
 

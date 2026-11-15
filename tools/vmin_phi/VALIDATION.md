@@ -1,3 +1,69 @@
+# Validation — configuration workers (v2)
+
+Tested on Linux with Python 3.12, NumPy 1.26.0, bitarray 2.8.2,
+psutil 5.9.5, netCDF4 1.7.5.1.post1 and matplotlib 3.10.8.
+
+## What changed
+
+Only `vmin_phi_sweep.py` and `_sweep_engine.py` changed among the Python files.
+The uploaded `_damping_core.py`, `sweep_workers.py`, `hybrid_no_traces.py` and
+legacy `wavefront_predictor.py` retain their exact original bytes. This runner
+no longer imports or invokes the wavefront predictor. No upstream codec file
+was modified.
+
+The scheduler launches independent fresh processes, each performing one whole
+configuration with the original serial predictor and the existing hybrid
+encoder/low-memory adapter. Only the coordinator writes combined results.
+Each job retains a distinct log, specification and checkpoint.
+
+## Compression equivalence
+
+A real Adelaide DN patch at source row 100, column 100, with shape 8x8x120,
+was evaluated at nu_min={-3,1}, phi={0,3}, A={0,3,15}, nu_max=4,
+t_inc=16, P=3, reduced prediction and narrow-neighbour local sums.
+
+All 12 configurations were run using the uploaded original version with one
+worker, then this version with one worker, then with two concurrent workers.
+Payload SHA-256, bit counts, rates, crop hashes, reconstruction errors and
+adaptation statistics matched exactly. Error bounds held for every point.
+The same two-worker run demonstrably had two configurations in flight;
+each configuration recorded one predictor process and zero shared-workspace
+bytes. This checks scheduling equivalence, not independent decoder validity.
+
+## Scheduling and workflow
+
+- Four configurations at t_inc=2048 completed with four concurrent workers.
+- The same four points with a 1.2 GiB test budget were automatically limited to
+  one worker; all completed with matching payload hashes and bit counts.
+- Runtime process inspection observed two independent worker processes and
+  zero nested worker processes.
+- Repeating a completed run with a different worker count started no new
+  configurations and left completed checkpoint bytes/timestamps unchanged.
+- Removing one checkpoint reran only that point.
+- Changed scientific settings and old-version metadata were rejected.
+- Dry-run wrote no outputs; plot-only regenerated plots without compression.
+- Interrupting a run terminated active workers and kept completed checkpoints;
+  resuming finished the remaining points without changing completed ones.
+- A deliberately invalid DN input failed in one worker while a valid input in
+  another worker completed and remained saved. The sweep reported failure.
+- Plots retain bits/sample versus nu_min; runtime and memory are CSV-only.
+
+## Limits
+
+These are small-crop correctness and scheduling tests. Full-image simulations
+and native Windows execution were not performed for this update. No full-image
+speedup or actual peak-memory reduction is claimed. Memory admission uses the
+existing conservative estimates; it is not a hard operating-system limit.
+Native library thread settings and fresh subprocess execution are used on
+both Linux and Windows; cores are not pinned.
+
+The earlier validation record below documents the uploaded v1 package only.
+Its within-configuration worker and shared-array descriptions do not apply to v2.
+
+---
+
+## Historical validation of the uploaded v1 package
+
 # Validation
 
 Test environment: Linux, Python 3.12, NumPy 1.26.4, bitarray 2.8.2, psutil 7.2.2.

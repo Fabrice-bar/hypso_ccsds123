@@ -8,8 +8,9 @@ narrow-neighbour, nu_max=4, t_inc=128, Theta=3, Omega=19, R=64, hybrid.
 Example (activated environment, from the verification repository root):
   python tools/vmin_phi/vmin_phi_sweep.py --input-dir data --workers 12
 
---workers N parallelizes prediction INSIDE one configuration. Configurations
-run sequentially; hybrid encoding remains serial. Low-memory storage is on.
+--workers N runs up to N COMPLETE configurations concurrently, subject to
+CPU and RAM availability. Each worker runs its own predictor and hybrid encoder.
+Low-memory storage is on. There is no nested predictor process pool.
 Runtime/memory are recorded in CSV but never plotted. Completed points resume.
 """
 from __future__ import annotations
@@ -28,9 +29,8 @@ import psutil
 import _damping_core as core
 import _sweep_engine as engine
 import sweep_workers as sw
-import wavefront_predictor as wavefront
 
-VERSION = "1.0.0-vmin-phi"
+VERSION = "2.0.0-vmin-phi-config-workers"
 
 
 def parse_args(argv=None):
@@ -58,9 +58,9 @@ def parse_args(argv=None):
     storage.add_argument("--low-memory",dest="low_memory",action="store_true",help="Default: omit hybrid text traces.")
     storage.add_argument("--standard-memory",dest="low_memory",action="store_false")
     parser.set_defaults(low_memory=True)
-    parser.add_argument("--workers",type=int,default=1,help="Predictor processes per configuration, e.g. 12; one configuration at a time.")
-    parser.add_argument("--rows-per-task",type=int,default=0,help="0: automatic dependency-aware row-block size.")
-    parser.add_argument("--work-dir",type=Path,help="Local disk for temporary shared arrays; default OUTPUT/_work.")
+    parser.add_argument("--workers",type=int,default=1,help="Maximum concurrent complete configurations; one process per configuration, limited by CPU/RAM.")
+    parser.add_argument("--rows-per-task",type=int,default=0,help="Legacy option, accepted but ignored: predictor task splitting is no longer used.")
+    parser.add_argument("--work-dir",type=Path,help="Legacy option, accepted but ignored: no shared predictor workspace is created.")
     parser.add_argument("--max-memory-gb",type=float,default=90,help="Estimated job ceiling in GiB, not an OS limit.")
     parser.add_argument("--total-memory-gb",type=float,default=90,help="Planning memory ceiling in GiB.")
     parser.add_argument("--memory-poll-ms",type=int,default=50)
@@ -188,9 +188,9 @@ def make_study(args,repo,inputs,jobs):
                bundle_sha256=core.file_digest(list(own.glob("*.py")),own),
                reference="CCSDS 120.2-G-2, Figure 4-10 style; HYPSO crops and fixed nu_max/t_inc selected for this study.",
                metric="Header + entropy payload/tail + word padding per scalar sample. External initialization excluded; inclusive rate also saved.",
-               execution="Sequential configurations, parallel predictor within each crop; hybrid encoding stays serial.",
+               execution="Parallel complete configurations; one process per configuration, serial predictor and hybrid encoder inside each worker.",
                checks="Encoder-side reconstruction bounds and actual applied adaptation schedule; no independent decoder.",
-               memory="OS peak_rss is crop coordinator only; process-tree RSS double-counts shared pages; sampled Linux PSS apportions them.")
+               memory="OS peak_rss covers one complete configuration process; aggregate RSS can double-count shared library pages; Linux PSS apportions them.")
     return {"study_id":hashlib.sha256(json.dumps(study,sort_keys=True).encode()).hexdigest(),
             "study":study,"model_path":str(repo)}
 
@@ -206,7 +206,6 @@ def main():
         print(f"Plots: {out}");return 0
     if not __debug__:raise ValueError("Do not run python -O; model assertions must remain enabled.")
     repo=engine.find_repo(args.repo);sw.load_model(repo,"vmax")
-    if args.workers>1:wavefront.validate_reference()
     if args.low_memory:
         from hybrid_no_traces import validate_reference
         validate_reference()
@@ -220,22 +219,25 @@ def main():
         info["label"]=scene.title() if scene in core.SCENES else scene.replace('_',' ')
         inputs[scene]=info
     jobs=build_jobs(args,inputs);metadata=make_study(args,repo,inputs,jobs)
-    limit=engine.allowed_predictor_workers(args.workers)
+    limit=min(engine.allowed_configuration_workers(args.workers),len(jobs))
     print(f"{len(inputs)} images x {len(args.a_values)} A values x {len(args.phi_values)} phi values x "
           f"{len(args.vmin_values)} nu_min values = {len(jobs)} configurations.")
     print(f"nu_min={args.vmin_values}; phi={args.phi_values}; A={args.a_values}; "
           f"fixed nu_max={args.nu_max}, t_inc={args.t_inc}.")
-    print(f"One configuration at a time; predictor workers requested {args.workers}, CPU allowance {limit}.")
+    print(f"One COMPLETE configuration per worker; up to {limit} concurrent configurations "
+          f"(--workers {args.workers}), subject to the RAM budget.")
+    if args.rows_per_task or args.work_dir:
+        print("Legacy --rows-per-task/--work-dir ignored; no nested predictor pool or shared workspace is used.")
     for scene,info in inputs.items():
         job=next(j for j in jobs if j["image"]==scene)
-        _,_,pool=wavefront.task_geometry(job["rows"],job["bands"],limit,args.rows_per_task)
-        need=job["estimated_ram_gib"]+(0.1*pool if limit>1 else 0)
-        disk=wavefront.workspace_bytes((job["rows"],job["columns"],job["bands"]),args.p,args.prediction_mode=="full")/engine.GIB if limit>1 else 0
+        need=job["estimated_ram_gib"]
+        memory_slots=max(0,min(limit,math.floor((engine.execution_budget(args)-.35)/need)))
         reason=job["dimension_issue"]
         if not reason and need>args.max_memory_gb:reason="exceeds per-job RAM limit"
         if not reason and need+.35>engine.execution_budget(args):reason="exceeds current available/total RAM budget"
         print(f"{info['label']}: source {info['source_shape_yxz']}, crop {job['rows']}x{job['columns']} at "
-              f"({job['crop_row']},{job['crop_col']}), estimated RAM {need:.2f} GiB, temporary files {disk:.2f} GiB"+
+              f"({job['crop_row']},{job['crop_col']}), estimated RAM {need:.2f} GiB per configuration; "
+              f"up to {memory_slots} configurations of this size fit the current budget"+
               (f"; SKIP NOW: {reason}" if reason else ""))
     if args.dry_run:
         print("Dry run: no compression or output writes.");return 0
