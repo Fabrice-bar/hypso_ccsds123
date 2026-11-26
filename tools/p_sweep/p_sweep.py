@@ -592,12 +592,25 @@ def make_header(ny, nx, nz, signed, P, local_sum, mode, fid, D, overrides=None):
     h.set_relative_error_limit_value(Rr)
 
     h.set_sample_representative_resolution(v["theta"])
-    h.set_band_varying_damping_flag(hd.BandVaryingDampingFlag.BAND_INDEPENDENT)
-    h.set_damping_table_flag(hd.DampingTableFlag.NOT_INCLUDED)
-    h.set_fixed_damping_value(v["phi"])
-    h.set_band_varying_offset_flag(hd.BandVaryingOffsetFlag.BAND_INDEPENDENT)
-    h.set_damping_offset_table_flag(hd.OffsetTableFlag.NOT_INCLUDED)
-    h.set_fixed_offset_value(0 if lossless else v["psi"])  # psi must be 0 when lossless
+    # Per-band damping / offset tables (overrides "phi_table" / "psi_table", one value per
+    # band) are written into the header, so the overhead is the same for every table.
+    phi_t, psi_t = v.get("phi_table"), v.get("psi_table")
+    if phi_t is None:
+        h.set_band_varying_damping_flag(hd.BandVaryingDampingFlag.BAND_INDEPENDENT)
+        h.set_damping_table_flag(hd.DampingTableFlag.NOT_INCLUDED)
+        h.set_fixed_damping_value(v["phi"])
+    else:
+        h.set_band_varying_damping_flag(hd.BandVaryingDampingFlag.BAND_DEPENDENT)
+        h.set_damping_table_flag(hd.DampingTableFlag.INCLUDED)
+        h.set_fixed_damping_value(0)
+    if psi_t is None:
+        h.set_band_varying_offset_flag(hd.BandVaryingOffsetFlag.BAND_INDEPENDENT)
+        h.set_damping_offset_table_flag(hd.OffsetTableFlag.NOT_INCLUDED)
+        h.set_fixed_offset_value(0 if lossless else v["psi"])  # psi must be 0 when lossless
+    else:
+        h.set_band_varying_offset_flag(hd.BandVaryingOffsetFlag.BAND_DEPENDENT)
+        h.set_damping_offset_table_flag(hd.OffsetTableFlag.INCLUDED)
+        h.set_fixed_offset_value(0)
 
     h.set_unary_length_limit(v["u_max"])
     h.set_rescaling_counter_size(v["gamma_star"])
@@ -607,6 +620,10 @@ def make_header(ny, nx, nz, signed, P, local_sum, mode, fid, D, overrides=None):
 
     h.set_damping_table_array_to_default()
     h.set_damping_offset_table_array_to_default()
+    if phi_t is not None:
+        h.damping_table_array[:] = np.asarray(phi_t, dtype=np.int64)
+    if psi_t is not None:
+        h.damping_offset_table_array[:] = 0 if lossless else np.asarray(psi_t, dtype=np.int64)
     h.set_accumulator_init_table_to_default()
     h.check_legal_config()
     return h
