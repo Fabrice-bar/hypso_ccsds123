@@ -636,6 +636,9 @@ def compress_bits(cube, signed, P, local_sum, mode, fid, D, lean=True, engine="l
     header_bits = len(h.get_header_bitstreams()[0])
     if engine == "fast":
         import fast_engine
+        if getattr(fast_engine, "VERSION", 1) < 2:
+            raise RuntimeError(f"{fast_engine.__file__} is an older version. Replace it with the latest fast_engine.py "
+                               "(it must match p_sweep.py).")
         nbits, packed, stats = fast_engine.compress(cube, h, k, M)
         return header_bits, nbits, packed, stats
     P_cls = M["LeanPredictor"] if lean else M["pred"].Predictor

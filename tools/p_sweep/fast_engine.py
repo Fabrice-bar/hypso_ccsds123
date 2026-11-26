@@ -20,6 +20,8 @@ only useful for testing).
 
 import numpy as np
 
+VERSION = 2  # 2: compress() also returns distortion statistics
+
 try:
     from numba import njit
 
@@ -194,7 +196,8 @@ def compress_kernel(img, prm, pstar, rho, wexp, alim, rlim, phi, psi,
                     child, wval, wlen, fval, flen, limit, thr):
     """Predictor (BIP order) and hybrid encoder (BI order) fused line by line.
 
-    Returns (packed bitstream bytes, number of bits, error code). Error code 0 = ok.
+    Returns (packed bitstream bytes, number of bits, error code, sum of squared
+    reconstruction errors, max absolute error, sum of squared samples). Error code 0 = ok.
     """
     Y, X, Z, D = prm[I_Y], prm[I_X], prm[I_Z], prm[I_D]
     smin, smax, smid = prm[I_SMIN], prm[I_SMAX], prm[I_SMID]
@@ -230,6 +233,9 @@ def compress_kernel(img, prm, pstar, rho, wexp, alim, rlim, phi, psi,
     buf = np.zeros(max(Y * X * Z // 2, 1024), dtype=np.uint8)
     pos = np.int64(0)
     n_i = (Z + M - 1) // M
+    sse = 0.0  # distortion of the decoder's reconstruction (clipped quantizer bin centre)
+    ss2 = 0.0
+    maxe = np.int64(0)
 
     for y in range(Y):
         r = y & 1
@@ -372,6 +378,17 @@ def compress_kernel(img, prm, pstar, rho, wexp, alim, rlim, phi, psi,
                         srv = (dsr + 1) // 2
                 sr[r, x, z] = srv
 
+                # reconstruction error: the decoder outputs the clipped bin centre (t > 0)
+                # and the exact sample at t = 0 (q is the unquantized residual there)
+                if t > 0:
+                    de = s - cq
+                    if de < 0:
+                        de = -de
+                    if de > maxe:
+                        maxe = de
+                    sse += float(de) * float(de)
+                ss2 += float(s) * float(s)
+
                 # prediction error and mapped quantizer index
                 err[z] = 2 * cq - drp
                 if t == 0:
@@ -413,7 +430,7 @@ def compress_kernel(img, prm, pstar, rho, wexp, alim, rlim, phi, psi,
                         if k > kmax:
                             k = kmax
                         if k < 2:
-                            return buf, pos, 1  # model asserts k >= 2
+                            return buf, pos, 1, sse, maxe, ss2  # model asserts k >= 2
                         pos = _reverse_gpo2(buf, pos, j, k, D, umax)
                     else:  # low-entropy: variable-to-variable code of the selected table
                         ci = -2
@@ -428,7 +445,7 @@ def compress_kernel(img, prm, pstar, rho, wexp, alim, rlim, phi, psi,
                             pos = _reverse_gpo2(buf, pos, j - limit[ci] - 1, 0, D, umax)
                         nxt = child[ci, state[ci], sym]
                         if nxt < 0:
-                            return buf, pos, 2  # prefix not in the code table
+                            return buf, pos, 2, sse, maxe, ss2  # prefix not in the code table
                         if wlen[ci, nxt] >= 0:
                             pos = _put_binary_zfill(buf, pos, wval[ci, nxt], wlen[ci, nxt])
                             state[ci] = 0
@@ -439,12 +456,12 @@ def compress_kernel(img, prm, pstar, rho, wexp, alim, rlim, phi, psi,
     buf = _grow(buf, pos, 16 * 64 + Z * 70 + 8)
     for i in range(16):
         if flen[i, state[i]] < 0:
-            return buf, pos, 3  # no flush word for this prefix
+            return buf, pos, 3, sse, maxe, ss2  # no flush word for this prefix
         pos = _put_binary_zfill(buf, pos, fval[i, state[i]], flen[i, state[i]])
     for z in range(Z):
         pos = _put_binary_zfill(buf, pos, acc[z], 2 + D + gstar)
     pos = _put(buf, pos, 1, 1)
-    return buf, pos, 0
+    return buf, pos, 0, sse, maxe, ss2
 
 
 # ----------------------------------------------------------------------------
@@ -460,7 +477,7 @@ def compress(cube, header, consts, M):
     """Compress a (Y, X, Z) integer cube with the settings in a model Header.
 
     M is the dict of imported model modules from p_sweep (hd, pred, henc_tables).
-    Returns (body_bits, packed_bytes).
+    Returns (body_bits, packed_bytes, distortion stats).
     """
     hd = M["hd"]
     h = header
@@ -517,14 +534,15 @@ def compress(cube, header, consts, M):
     if psi.size == 1:
         psi = np.full(Z, psi[0], dtype=np.int64)
     img = cube if cube.dtype.kind in "iu" and cube.dtype.itemsize <= 4 or cube.dtype == np.int64 else cube.astype(np.int64)
-    buf, nbits, code = compress_kernel(
+    buf, nbits, code, sse, maxe, ss2 = compress_kernel(
         np.ascontiguousarray(img), prm, np.asarray(p.spectral_bands_used, dtype=np.int64),
         np.asarray(p.weight_update_scaling_exponent, dtype=np.int64), wexp,
         np.asarray(p.absolute_error_limits, dtype=np.int64), np.asarray(p.relative_error_limits, dtype=np.int64),
         phi, psi, child, wval, wlen, fval, flen, limit, thr)
     if code:
         raise RuntimeError(f"fast engine stopped: {ERRORS.get(code, code)}")
-    return int(nbits), buf[: (int(nbits) + 7) // 8]
+    stats = {"sse": float(sse), "max_abs_err": int(maxe), "sum_sq": float(ss2), "n": Y * X * Z}
+    return int(nbits), buf[: (int(nbits) + 7) // 8], stats
 
 
 def bits_to01(packed, nbits):
